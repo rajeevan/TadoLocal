@@ -23,8 +23,84 @@ import logging
 import sqlite3
 import time
 from typing import Dict, List, Optional, Callable
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+def get_timezone(db_path: str) -> Optional[str]:
+    """
+    Get timezone from database.
+    
+    Returns the timezone string from tado_homes table, or None if not configured.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.execute("""
+                SELECT timezone FROM tado_homes
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Failed to get timezone from database: {e}")
+        return None
+
+
+def utc_to_local(utc_dt: datetime.datetime, timezone_str: str) -> datetime.datetime:
+    """
+    Convert UTC datetime to local timezone.
+    
+    Args:
+        utc_dt: UTC datetime (naive or timezone-aware)
+        timezone_str: Timezone string (e.g., 'Europe/Amsterdam')
+    
+    Returns:
+        Local datetime (timezone-aware)
+    """
+    try:
+        tz = ZoneInfo(timezone_str)
+        # If datetime is naive, assume it's UTC
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=datetime.timezone.utc)
+        # Convert to local timezone
+        return utc_dt.astimezone(tz)
+    except Exception as e:
+        logger.warning(f"Failed to convert UTC to local timezone {timezone_str}: {e}, using UTC")
+        # Fallback: return UTC datetime
+        if utc_dt.tzinfo is None:
+            return utc_dt.replace(tzinfo=datetime.timezone.utc)
+        return utc_dt
+
+
+def get_local_now(db_path: str) -> datetime.datetime:
+    """
+    Get current local time based on configured timezone.
+    
+    Returns timezone-aware datetime in local timezone, or UTC if timezone not configured.
+    """
+    timezone_str = get_timezone(db_path)
+    
+    # Get current UTC time
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    
+    if timezone_str:
+        try:
+            # Validate timezone
+            ZoneInfo(timezone_str)
+            # Convert to local time
+            return utc_to_local(utc_now, timezone_str)
+        except Exception as e:
+            logger.warning(f"Invalid timezone '{timezone_str}': {e}, using UTC")
+            return utc_now
+    
+    # No timezone configured, use UTC
+    return utc_now
 
 
 def round_to_5_minutes(dt: datetime.datetime) -> datetime.datetime:
@@ -102,7 +178,7 @@ def get_current_schedule_temperature(db_path: str, zone_id: int) -> Optional[flo
     or None if no schedule matches.
     """
     import sqlite3
-    now = datetime.datetime.now()
+    now = get_local_now(db_path)
     current_day = now.weekday()  # 0=Monday, 6=Sunday
     current_time_rounded = round_to_5_minutes(now)
     
@@ -194,12 +270,64 @@ class SchedulerService:
         self.running = False
         self.task: Optional[asyncio.Task] = None
         self.last_applied: Dict[int, str] = {}  # zone_id -> last applied schedule time string
+        self.timezone_cache: Optional[str] = None
+        self.timezone_cache_time: Optional[float] = None
+        self.timezone_cache_ttl: float = 3600.0  # Cache for 1 hour
         
+    def _get_timezone(self) -> Optional[str]:
+        """
+        Get timezone with caching.
+        
+        Returns cached timezone if available and not expired, otherwise fetches from database.
+        """
+        current_time = time.time()
+        
+        # Check if cache is valid
+        if (self.timezone_cache is not None and 
+            self.timezone_cache_time is not None and
+            current_time - self.timezone_cache_time < self.timezone_cache_ttl):
+            return self.timezone_cache
+        
+        # Fetch from database
+        timezone_str = get_timezone(self.db_path)
+        self.timezone_cache = timezone_str
+        self.timezone_cache_time = current_time
+        
+        if timezone_str:
+            logger.info(f"Scheduler using timezone: {timezone_str}")
+        else:
+            logger.info("Scheduler using UTC (no timezone configured)")
+        
+        return timezone_str
+    
+    def _get_local_now(self) -> datetime.datetime:
+        """Get current local time using cached timezone."""
+        timezone_str = self._get_timezone()
+        
+        # Get current UTC time
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        
+        if timezone_str:
+            try:
+                # Validate timezone
+                ZoneInfo(timezone_str)
+                # Convert to local time
+                return utc_to_local(utc_now, timezone_str)
+            except Exception as e:
+                logger.warning(f"Invalid timezone '{timezone_str}': {e}, using UTC")
+                return utc_now
+        
+        # No timezone configured, use UTC
+        return utc_now
+    
     async def start(self):
         """Start the scheduler background task."""
         if self.running:
             logger.warning("Scheduler service already running")
             return
+        
+        # Initialize timezone cache
+        self._get_timezone()
         
         self.running = True
         self.task = asyncio.create_task(self._scheduler_loop())
@@ -254,7 +382,7 @@ class SchedulerService:
     
     async def _check_and_apply_schedules(self):
         """Check all active schedules and apply matching ones."""
-        now = datetime.datetime.now()
+        now = self._get_local_now()
         current_day = now.weekday()  # 0=Monday, 6=Sunday
         current_time_rounded = round_to_5_minutes(now)
         current_time_str = current_time_rounded.strftime('%H:%M')
@@ -295,7 +423,10 @@ class SchedulerService:
         finally:
             conn.close()
         
-        # Process each schedule
+        # Track which zones had schedules applied at current time
+        zones_applied_at_current_time = set()
+        
+        # Process each schedule - first check for schedules matching current time
         for schedule in schedules:
             # Check if we should stop processing
             if not self.running:
@@ -332,10 +463,91 @@ class SchedulerService:
                     timeout=5.0
                 )
                 self.last_applied[zone_id] = schedule_key
+                zones_applied_at_current_time.add(zone_id)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout applying schedule {schedule['schedule_id']} to zone {zone_id}")
             except Exception as e:
                 logger.error(f"Failed to apply schedule {schedule['schedule_id']} to zone {zone_id}: {e}")
+        
+        # For zones in AUTO mode that didn't get a schedule applied at current time,
+        # check if there's a past schedule that should be applied (e.g., after long downtime)
+        for zone_id, zone_mode in zone_modes.items():
+            # Check if we should stop processing
+            if not self.running:
+                return  # Exit immediately if stopped
+            
+            # Only process zones in AUTO mode with no manual override
+            if zone_mode.get('current_mode') != 3:  # Not in AUTO mode
+                continue
+            
+            if zone_mode.get('manual_override_active', False):
+                continue  # Manual override is active, skip scheduler
+            
+            # Skip if we already applied a schedule at current time for this zone
+            if zone_id in zones_applied_at_current_time:
+                continue
+            
+            # Find the most recent past schedule for this zone that applies today
+            zone_schedules = [s for s in schedules if s['zone_id'] == zone_id]
+            today_schedules = []
+            
+            for schedule in zone_schedules:
+                # Check if schedule applies to today
+                schedule_type = schedule['schedule_type']
+                days_of_week = schedule['days_of_week']
+                
+                applies_today = False
+                if schedule_type == 'any_day':
+                    applies_today = True
+                elif schedule_type == 'week_weekends':
+                    applies_today = day_matches_week_weekends(days_of_week, current_day)
+                else:  # day_of_week
+                    try:
+                        days_list = json.loads(days_of_week)
+                        applies_today = current_day in days_list
+                    except (json.JSONDecodeError, TypeError):
+                        applies_today = False
+                
+                if applies_today:
+                    # Parse schedule time
+                    schedule_time = parse_time(schedule['time'])
+                    schedule_datetime = now.replace(hour=schedule_time[0], minute=schedule_time[1], second=0, microsecond=0)
+                    
+                    # Check if this schedule time has passed today (but not exactly at current time)
+                    if schedule_datetime < current_time_rounded:
+                        today_schedules.append((schedule_datetime, schedule))
+            
+            if today_schedules:
+                # Sort by time (most recent first) and get the latest past schedule
+                today_schedules.sort(key=lambda x: x[0], reverse=True)
+                most_recent_schedule = today_schedules[0][1]
+                
+                # Check if we already applied this schedule recently
+                # Use a more lenient key that includes the schedule time but not the exact day
+                # This allows applying the same schedule if service was down for multiple days
+                schedule_key = f"{most_recent_schedule['time']}_{current_day}"
+                
+                # Only apply if we haven't applied this schedule recently (within last 5 minutes)
+                # or if the last applied schedule is different
+                last_applied_key = self.last_applied.get(zone_id)
+                if last_applied_key != schedule_key:
+                    # Apply the most recent past schedule
+                    try:
+                        logger.info(
+                            f"Scheduler: Applying past schedule {most_recent_schedule['schedule_id']} to zone {zone_id}: "
+                            f"{most_recent_schedule['temperature']}°C (scheduled at {most_recent_schedule['time']}, "
+                            f"current time {current_time_str})"
+                        )
+                        # Use timeout to prevent blocking shutdown
+                        await asyncio.wait_for(
+                            self.apply_temperature_callback(zone_id, most_recent_schedule['temperature']),
+                            timeout=5.0
+                        )
+                        self.last_applied[zone_id] = schedule_key
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout applying past schedule {most_recent_schedule['schedule_id']} to zone {zone_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to apply past schedule {most_recent_schedule['schedule_id']} to zone {zone_id}: {e}")
         
         # Clean up old entries from last_applied (keep only recent ones)
         # This prevents memory growth over time

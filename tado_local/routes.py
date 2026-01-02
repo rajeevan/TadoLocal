@@ -2004,6 +2004,103 @@ def register_routes(app: FastAPI, get_tado_api):
             }
         )
 
+    @app.get("/config/timezone", tags=["Config"])
+    async def get_timezone_config(api_key: Optional[str] = Depends(get_api_key)):
+        """
+        Get the configured timezone for the scheduler.
+        
+        Returns the timezone string (e.g., 'Europe/Amsterdam') or None if not configured.
+        If not configured, scheduler uses UTC.
+        """
+        tado_api = get_tado_api()
+        from .scheduler import get_timezone
+        
+        timezone_str = get_timezone(tado_api.state_manager.db_path)
+        
+        return {
+            "timezone": timezone_str,
+            "using_utc": timezone_str is None
+        }
+    
+    @app.put("/config/timezone", tags=["Config"])
+    async def set_timezone_config(
+        timezone_data: dict = Body(...),
+        api_key: Optional[str] = Depends(get_api_key)
+    ):
+        """
+        Set the timezone for the scheduler.
+        
+        Args:
+            timezone_data: JSON object with 'timezone' field (e.g., {"timezone": "Europe/Amsterdam"})
+        
+        The timezone must be a valid IANA timezone identifier (e.g., 'Europe/Amsterdam', 'America/New_York').
+        The scheduler will use this timezone for all schedule matching operations.
+        
+        To reset to UTC, set timezone to null or empty string.
+        """
+        tado_api = get_tado_api()
+        
+        # Extract timezone from request body
+        timezone_str = timezone_data.get('timezone')
+        
+        # Validate timezone if provided
+        if timezone_str:
+            timezone_str = timezone_str.strip()
+            if not timezone_str:
+                timezone_str = None
+            else:
+                # Validate timezone using zoneinfo
+                try:
+                    from zoneinfo import ZoneInfo
+                    ZoneInfo(timezone_str)  # This will raise ZoneInfoNotFoundError if invalid
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid timezone '{timezone_str}': {str(e)}. Use IANA timezone identifier (e.g., 'Europe/Amsterdam')"
+                    )
+        
+        # Update timezone in database
+        conn = sqlite3.connect(tado_api.state_manager.db_path)
+        try:
+            # Check if tado_homes table has any rows
+            cursor = conn.execute("SELECT COUNT(*) FROM tado_homes")
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                # No home exists, create a default entry
+                conn.execute("""
+                    INSERT INTO tado_homes (tado_home_id, name, timezone, updated_at)
+                    VALUES (0, 'Default Home', ?, CURRENT_TIMESTAMP)
+                """, (timezone_str,))
+            else:
+                # Update existing home(s) - update all homes to use the same timezone
+                conn.execute("""
+                    UPDATE tado_homes
+                    SET timezone = ?, updated_at = CURRENT_TIMESTAMP
+                """, (timezone_str,))
+            
+            conn.commit()
+            
+            # Invalidate scheduler timezone cache if it exists
+            if tado_api.scheduler_service:
+                tado_api.scheduler_service.timezone_cache = None
+                tado_api.scheduler_service.timezone_cache_time = None
+                logger.info(f"Timezone cache invalidated, new timezone: {timezone_str or 'UTC'}")
+            
+            logger.info(f"Timezone configured: {timezone_str or 'UTC (default)'}")
+            
+            return {
+                "timezone": timezone_str,
+                "using_utc": timezone_str is None,
+                "message": f"Timezone set to {timezone_str or 'UTC'}"
+            }
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to set timezone: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to set timezone: {str(e)}")
+        finally:
+            conn.close()
+    
     @app.post("/refresh", tags=["Admin"])
     async def refresh_data(api_key: Optional[str] = Depends(get_api_key)):
         """Manually refresh accessories data from HomeKit bridge."""

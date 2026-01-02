@@ -163,6 +163,7 @@ def ensure_schema_and_migrate(db_path: str):
     incremental migrations. Currently migration to user_version 2 adds a stable
     uuid column to the `zones` table and populates it with generated UUIDs.
     Migration to version 3 adds zone_schedules and zone_mode_tracking tables.
+    Migration to version 4 ensures tado_homes.timezone column exists.
     """
     import sqlite3
     import uuid as _uuid
@@ -171,7 +172,7 @@ def ensure_schema_and_migrate(db_path: str):
     # Supported schema version for this codebase. If the database reports a
     # higher user_version we should refuse to start to avoid silent data loss
     # or incompatible assumptions.
-    SUPPORTED_SCHEMA_VERSION = 3
+    SUPPORTED_SCHEMA_VERSION = 4
 
     # Open connection and check current schema version before applying changes
     conn = sqlite3.connect(db_path)
@@ -299,6 +300,40 @@ def ensure_schema_and_migrate(db_path: str):
                 raise
         except Exception as e:
             logger.error(f"Migration to version 3 failed: {e}")
+            raise
+
+    # Migration to version 4: ensure tado_homes.timezone column exists
+    if current_version < 4:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Check if timezone column exists in tado_homes table
+                # SQLite doesn't have a direct way to check, so we'll try to add it
+                # and ignore if it already exists
+                try:
+                    conn.execute("ALTER TABLE tado_homes ADD COLUMN timezone TEXT")
+                    logger.info("Added timezone column to tado_homes table")
+                except sqlite3.OperationalError as e:
+                    error_msg = str(e).lower()
+                    # Column may already exist - this is fine
+                    # SQLite error messages vary: "duplicate column name: timezone" or similar
+                    if "duplicate" in error_msg or "already exists" in error_msg:
+                        logger.debug("timezone column already exists in tado_homes table")
+                    else:
+                        # Some other error - re-raise it
+                        raise
+
+                conn.execute("PRAGMA user_version = 4")
+                current_version = 4
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            logger.error(f"Migration to version 4 failed: {e}")
             raise
 
     # Ensure all schema scripts applied now that migrations are done
