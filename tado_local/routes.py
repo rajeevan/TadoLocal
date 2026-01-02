@@ -357,21 +357,48 @@ def register_routes(app: FastAPI, get_tado_api):
                     battery_state = device_info.get('battery_state')
                     battery_low = battery_state is not None and battery_state != 'NORMAL'
 
+                    # Mode: Use tracked mode from zone_mode_tracking if device is zone leader (supports AUTO=3)
+                    # Otherwise use device state (0=Off, 1=Heat)
+                    zone_id = device_info.get('zone_id')
+                    is_zone_leader = device_info.get('is_zone_leader', False)
+                    device_mode = state.get('target_heating_cooling_state', 0)
+                    
+                    # Also check zone_cache to find if this device is a zone leader
+                    # (in case device_info doesn't have zone_id set correctly)
+                    if not zone_id or not is_zone_leader:
+                        for z_id, z_info in tado_api.state_manager.zone_cache.items():
+                            if z_info.get('leader_device_id') == device_id:
+                                zone_id = z_id
+                                is_zone_leader = True
+                                break
+                    
+                    if zone_id and is_zone_leader:
+                        # Get tracked mode from zone_mode_tracking (supports AUTO=3)
+                        mode_info = tado_api.state_manager.get_zone_mode(zone_id)
+                        if mode_info:
+                            mode = mode_info['current_mode']  # Can be 0=Off, 1=Heat, 3=Auto
+                        else:
+                            # No tracked mode, use device state
+                            mode = device_mode
+                    else:
+                        # Not a zone leader, use device state
+                        mode = device_mode
+
                     thermostat = {
                         'device_id': device_id,
                         'aid': accessory.get('aid'),
                         'serial_number': accessory.get('serial_number'),
                         'zone_name': device_info.get('zone_name'),
-                        'zone_id': device_info.get('zone_id'),
+                        'zone_id': zone_id,
                         'device_type': device_info.get('device_type'),
-                        'is_zone_leader': device_info.get('is_zone_leader', False),
+                        'is_zone_leader': is_zone_leader,
                         'state': {
                             'cur_temp_c': cur_temp_c,
                             'cur_temp_f': round(cur_temp_c * 9/5 + 32, 1) if cur_temp_c is not None else None,
                             'hum_perc': state.get('humidity'),
                             'target_temp_c': target_temp_c,
                             'target_temp_f': round(target_temp_c * 9/5 + 32, 1) if target_temp_c is not None else None,
-                            'mode': state.get('target_heating_cooling_state', 0),
+                            'mode': mode,
                             'cur_heating': 1 if state.get('current_heating_cooling_state') == 1 else 0,
                             'valve_position': state.get('valve_position'),
                             'battery_low': battery_low,
@@ -410,13 +437,13 @@ def register_routes(app: FastAPI, get_tado_api):
                 break
 
         if not is_thermostat:
-            raise HTTPException(status_code=400, detail=f"Device {id} is not a thermostat")
+            raise HTTPException(status_code=400, detail=f"Device {thermostat_id} is not a thermostat")
 
         # Get device info from cache
-        device_info = tado_api.state_manager.device_info_cache.get(id, {})
+        device_info = tado_api.state_manager.device_info_cache.get(thermostat_id, {})
 
         # Build standardized state
-        state = tado_api.state_manager.get_current_state(id)
+        state = tado_api.state_manager.get_current_state(thermostat_id)
         cur_temp_c = state.get('current_temperature')
         target_temp_c = state.get('target_temperature')
 
@@ -424,13 +451,41 @@ def register_routes(app: FastAPI, get_tado_api):
         battery_state = device_info.get('battery_state')
         battery_low = battery_state is not None and battery_state != 'NORMAL'
 
+        # Mode: Use tracked mode from zone_mode_tracking if device is zone leader (supports AUTO=3)
+        # Otherwise use device state (0=Off, 1=Heat)
+        zone_id = device_info.get('zone_id')
+        is_zone_leader = device_info.get('is_zone_leader', False)
+        device_mode = state.get('target_heating_cooling_state', 0)
+        
+        # Also check zone_cache to find if this device is a zone leader
+        # (in case device_info doesn't have zone_id set correctly)
+        if not zone_id or not is_zone_leader:
+            for z_id, z_info in tado_api.state_manager.zone_cache.items():
+                if z_info.get('leader_device_id') == thermostat_id:
+                    zone_id = z_id
+                    is_zone_leader = True
+                    break
+        
+        if zone_id and is_zone_leader:
+            # Get tracked mode from zone_mode_tracking (supports AUTO=3)
+            mode_info = tado_api.state_manager.get_zone_mode(zone_id)
+            if mode_info:
+                mode = mode_info['current_mode']  # Can be 0=Off, 1=Heat, 3=Auto
+            else:
+                # No tracked mode, use device state
+                mode = device_mode
+        else:
+            # Not a zone leader, use device state
+            mode = device_mode
+
         thermostat = {
             'device_id': thermostat_id,
             'aid': accessory.get('aid'),
             'serial_number': accessory.get('serial_number'),
             'zone_name': device_info.get('zone_name'),
+            'zone_id': zone_id,
             'device_type': device_info.get('device_type'),
-            'is_zone_leader': device_info.get('is_zone_leader'),
+            'is_zone_leader': is_zone_leader,
             'is_circuit_driver': device_info.get('is_circuit_driver'),
             'state': {
                 'cur_temp_c': cur_temp_c,
@@ -438,7 +493,7 @@ def register_routes(app: FastAPI, get_tado_api):
                 'hum_perc': state.get('humidity'),
                 'target_temp_c': target_temp_c,
                 'target_temp_f': round(target_temp_c * 9/5 + 32, 1) if target_temp_c is not None else None,
-                'mode': state.get('target_heating_cooling_state', 0),
+                'mode': mode,
                 'cur_heating': 1 if state.get('current_heating_cooling_state') == 1 else 0,
                 'valve_position': state.get('valve_position'),
                 'battery_low': battery_low,
@@ -519,8 +574,10 @@ def register_routes(app: FastAPI, get_tado_api):
                     mode = mode_info['current_mode']  # Can be 0=Off, 1=Heat, 3=Auto
                 else:
                     # No tracked mode, initialize with device state
+                    # Note: Device state can only be 0 (Off) or 1 (Heat), never 3 (Auto)
                     mode = target_heating_cooling_state
-                    # Initialize tracking with current device state
+                    # Initialize tracking with current device state (only if not already set)
+                    # This ensures we have a record, but won't overwrite existing AUTO mode
                     tado_api.state_manager.set_zone_mode(zone_id, mode, is_manual=False)
 
                 # Currently heating: From zone leader, EXCEPT for circuit drivers with other devices
@@ -680,8 +737,10 @@ def register_routes(app: FastAPI, get_tado_api):
                 mode = mode_info['current_mode']  # Can be 0=Off, 1=Heat, 3=Auto
             else:
                 # No tracked mode, initialize with device state
+                # Note: Device state can only be 0 (Off) or 1 (Heat), never 3 (Auto)
                 mode = target_heating_cooling_state
-                # Initialize tracking with current device state
+                # Initialize tracking with current device state (only if not already set)
+                # This ensures we have a record, but won't overwrite existing AUTO mode
                 tado_api.state_manager.set_zone_mode(zone_id, mode, is_manual=False)
 
             # Currently heating: From zone leader, EXCEPT for circuit drivers with other devices
@@ -1188,11 +1247,14 @@ def register_routes(app: FastAPI, get_tado_api):
                 heating_enabled = True
 
         # Check if this is a manual temperature change while in AUTO mode
-        if temperature is not None and temperature > 0:
+        # Skip this check if we're switching TO AUTO mode (mode parameter was 'auto')
+        # because in that case, the temperature is from the schedule, not a manual change
+        # When temperature is set via API while already in AUTO mode, it's always a manual change
+        if temperature is not None and temperature > 0 and mode != 'auto':
             current_mode_info = tado_api.state_manager.get_zone_mode(zone_id)
             if current_mode_info and current_mode_info['current_mode'] == 3:  # AUTO mode
-                # Manual temperature change in AUTO mode - switch to HEAT
-                logger.info(f"Zone {zone_id}: Manual temperature change detected in AUTO mode, switching to HEAT")
+                # Temperature set via API while in AUTO mode - always switch to HEAT (manual override)
+                logger.info(f"Zone {zone_id}: Temperature set via API in AUTO mode ({temperature}°C), switching to HEAT")
                 tado_api.state_manager.set_zone_mode(zone_id, 1, is_manual=True)  # Switch to HEAT
                 # Continue with temperature change
 
@@ -1272,8 +1334,18 @@ def register_routes(app: FastAPI, get_tado_api):
             await tado_api.set_device_characteristics(leader_device_id, char_updates)
 
             # Get current tracked mode to return in response
+            # Always use the tracked mode from database, not device state
             mode_info = tado_api.state_manager.get_zone_mode(zone_id)
-            tracked_mode = mode_info['current_mode'] if mode_info else (1 if heating_enabled else 0)
+            if mode_info:
+                tracked_mode = mode_info['current_mode']
+            else:
+                # No tracked mode - this shouldn't happen if mode was set above
+                # But if it does, use the mode_value that was set (if mode parameter was provided)
+                if mode is not None:
+                    tracked_mode = mode_value
+                else:
+                    # Fallback to device state (but this shouldn't happen)
+                    tracked_mode = 1 if heating_enabled else 0
             
             # Map mode value to string for response
             mode_str = 'auto' if tracked_mode == 3 else ('heat' if tracked_mode == 1 else 'off')

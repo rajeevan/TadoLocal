@@ -596,6 +596,9 @@ class DeviceStateManager:
             mode: Mode value (0=Off, 1=Heat, 3=Auto)
             is_manual: True if this is a manual change (sets override flag)
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         conn = sqlite3.connect(self.db_path)
         try:
             if is_manual:
@@ -608,14 +611,18 @@ class DeviceStateManager:
                         last_manual_change = CURRENT_TIMESTAMP,
                         updated_at = CURRENT_TIMESTAMP
                 """, (zone_id, mode))
+                logger.debug(f"Set zone {zone_id} mode to {mode} (manual)")
             else:
+                # When not manual (e.g., AUTO mode), clear manual override flag
                 conn.execute("""
-                    INSERT INTO zone_mode_tracking (zone_id, current_mode, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO zone_mode_tracking (zone_id, current_mode, manual_override_active, updated_at)
+                    VALUES (?, ?, 0, CURRENT_TIMESTAMP)
                     ON CONFLICT(zone_id) DO UPDATE SET
                         current_mode = excluded.current_mode,
+                        manual_override_active = 0,
                         updated_at = CURRENT_TIMESTAMP
                 """, (zone_id, mode))
+                logger.debug(f"Set zone {zone_id} mode to {mode} (automatic)")
             conn.commit()
         finally:
             conn.close()

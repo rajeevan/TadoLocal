@@ -500,9 +500,28 @@ class TadoLocalAPI:
                                     # Check if zone is in AUTO mode
                                     mode_info = self.state_manager.get_zone_mode(zone_id)
                                     if mode_info and mode_info['current_mode'] == 3:  # AUTO mode
-                                        # Manual change detected - switch to HEAT mode
-                                        logger.info(f"Zone {zone_id} ({zone_name}): Physical device change detected in AUTO mode, switching to HEAT")
-                                        self.state_manager.set_zone_mode(zone_id, 1, is_manual=True)
+                                        # Check if this change matches the scheduled temperature
+                                        # If it does, it's from the scheduler, not a manual change
+                                        from .scheduler import get_current_schedule_temperature
+                                        scheduled_temp = get_current_schedule_temperature(self.state_manager.db_path, zone_id)
+                                        
+                                        # Get the new temperature value
+                                        new_temp = new_val if field_name == 'target_temperature' else None
+                                        
+                                        # If this is a temperature change, check if it matches scheduled temp
+                                        is_scheduler_change = False
+                                        if field_name == 'target_temperature' and new_temp is not None:
+                                            # Allow small floating point differences (0.1°C tolerance)
+                                            if scheduled_temp is not None and abs(new_temp - scheduled_temp) < 0.1:
+                                                # This matches the scheduled temperature - it's from the scheduler
+                                                is_scheduler_change = True
+                                                logger.debug(f"Zone {zone_id} ({zone_name}): Temperature change to {new_temp}°C matches scheduled temperature ({scheduled_temp}°C), keeping AUTO mode")
+                                        
+                                        # Only switch to HEAT if this is NOT a scheduler-initiated change
+                                        if not is_scheduler_change:
+                                            # Temperature doesn't match schedule or no schedule - this is a manual change
+                                            logger.info(f"Zone {zone_id} ({zone_name}): Manual change detected in AUTO mode (temp={new_temp}, scheduled={scheduled_temp}), switching to HEAT")
+                                            self.state_manager.set_zone_mode(zone_id, 1, is_manual=True)
 
             # Skip logging during initialization
             if not self.is_initializing:
