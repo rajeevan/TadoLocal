@@ -28,6 +28,7 @@ from aiohomekit.controller.ip.pairing import IpPairing
 
 from .state import DeviceStateManager
 from .homekit_uuids import get_characteristic_name
+from .scheduler import SchedulerService
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -60,6 +61,9 @@ class TadoLocalAPI:
         self.subscribed_characteristics: List[tuple[int, int]] = []
         self.background_tasks: List[asyncio.Task] = []
         self.is_shutting_down = False
+        
+        # Scheduler service
+        self.scheduler_service: Optional[SchedulerService] = None
 
     async def initialize(self, pairing: IpPairing):
         """Initialize the API with a HomeKit pairing."""
@@ -69,12 +73,48 @@ class TadoLocalAPI:
         await self.initialize_device_states()
         self.is_initializing = False  # Re-enable change logging
         await self.setup_event_listeners()
+        
+        # Initialize scheduler service
+        async def apply_temperature(zone_id: int, temperature: float):
+            """Callback to apply temperature from scheduler (only called when zone is in AUTO mode)."""
+            try:
+                # Get zone leader
+                zone_info = self.state_manager.zone_cache.get(zone_id)
+                if not zone_info or not zone_info.get('leader_device_id'):
+                    return
+                
+                leader_device_id = zone_info['leader_device_id']
+                
+                # When in AUTO mode, set temperature and ensure device is in HEAT mode
+                # (thermostat doesn't support AUTO, so we set it to HEAT)
+                char_updates = {
+                    'target_temperature': temperature,
+                    'target_heating_cooling_state': 1  # Ensure HEAT mode (AUTO is tracked locally)
+                }
+                await self.set_device_characteristics(leader_device_id, char_updates)
+            except Exception as e:
+                logger.error(f"Failed to apply scheduled temperature to zone {zone_id}: {e}")
+        
+        self.scheduler_service = SchedulerService(self.state_manager.db_path, apply_temperature)
+        await self.scheduler_service.start()
+        
         logger.info("Tado Local initialized successfully")
 
     async def cleanup(self):
         """Clean up resources and unsubscribe from events."""
         logger.info("Starting cleanup...")
         self.is_shutting_down = True
+
+        # Stop scheduler service (with timeout to avoid blocking)
+        if self.scheduler_service:
+            logger.info("Stopping scheduler service...")
+            try:
+                await asyncio.wait_for(self.scheduler_service.stop(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Scheduler service stop timed out, continuing shutdown")
+            except Exception as e:
+                logger.warning(f"Error stopping scheduler service: {e}")
+            self.scheduler_service = None
 
         # Cancel all background tasks
         if self.background_tasks:
@@ -87,35 +127,40 @@ class TadoLocalAPI:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
             logger.info("Background tasks cancelled")
 
-        # Unsubscribe from all event characteristics
+        # Unsubscribe from all event characteristics (with timeout to avoid blocking)
         if self.pairing and self.subscribed_characteristics:
             try:
                 logger.info(f"Unsubscribing from {len(self.subscribed_characteristics)} event characteristics")
-                await self.pairing.unsubscribe(self.subscribed_characteristics)
+                await asyncio.wait_for(
+                    self.pairing.unsubscribe(self.subscribed_characteristics),
+                    timeout=3.0
+                )
                 logger.info("Successfully unsubscribed from events")
+            except asyncio.TimeoutError:
+                logger.warning("Unsubscribe timed out, continuing shutdown")
             except Exception as e:
                 logger.warning(f"Error during unsubscribe: {e}")
 
-        # Close all event listener queues
+        # Close all event listener queues (with timeout to avoid blocking)
         if self.event_listeners:
             logger.info(f"Closing {len(self.event_listeners)} event listener queues")
-            for queue in self.event_listeners:
+            for queue in list(self.event_listeners):
                 try:
-                    # Signal end of stream
-                    await queue.put(None)
-                except:
-                    pass  # Queue might already be closed
+                    # Signal end of stream with timeout
+                    await asyncio.wait_for(queue.put(None), timeout=0.5)
+                except (asyncio.TimeoutError, Exception):
+                    pass  # Queue might be full or closed, continue
             self.event_listeners.clear()
 
-        # Close zone-only event listener queues
+        # Close zone-only event listener queues (with timeout to avoid blocking)
         if self.zone_event_listeners:
             logger.info(f"Closing {len(self.zone_event_listeners)} zone event listener queues")
-            for queue in self.zone_event_listeners:
+            for queue in list(self.zone_event_listeners):
                 try:
-                    # Signal end of stream
-                    await queue.put(None)
-                except:
-                    pass  # Queue might already be closed
+                    # Signal end of stream with timeout
+                    await asyncio.wait_for(queue.put(None), timeout=0.5)
+                except (asyncio.TimeoutError, Exception):
+                    pass  # Queue might be full or closed, continue
             self.zone_event_listeners.clear()
 
         logger.info("Cleanup complete")
@@ -415,6 +460,7 @@ class TadoLocalAPI:
             # Get device info for better logging
             device_id = self.accessories_id.get(aid)
             device_info = self.state_manager.get_device_info(device_id) if device_id else {}
+            zone_id = device_info.get('zone_id')
             zone_name = device_info.get('zone_name', 'No Zone')
             device_name = device_info.get('name') or device_info.get('serial_number', f'Device {device_id}')
             is_zone_leader = device_info.get('is_zone_leader', False)
@@ -445,6 +491,18 @@ class TadoLocalAPI:
                         )
                         if field_name:
                             logger.debug(f"Updated device {accessory['id']} {field_name}: {old_val} -> {new_val}")
+                            
+                            # Detect manual changes from device (physical interaction)
+                            # Check if this is a target_temperature or target_heating_cooling_state change
+                            if field_name in ['target_temperature', 'target_heating_cooling_state']:
+                                # Check if device is a zone leader
+                                if zone_id and is_zone_leader:
+                                    # Check if zone is in AUTO mode
+                                    mode_info = self.state_manager.get_zone_mode(zone_id)
+                                    if mode_info and mode_info['current_mode'] == 3:  # AUTO mode
+                                        # Manual change detected - switch to HEAT mode
+                                        logger.info(f"Zone {zone_id} ({zone_name}): Physical device change detected in AUTO mode, switching to HEAT")
+                                        self.state_manager.set_zone_mode(zone_id, 1, is_manual=True)
 
             # Skip logging during initialization
             if not self.is_initializing:
@@ -577,13 +635,22 @@ class TadoLocalAPI:
                     leader_state = self._build_device_state(leader_device_id)
 
                     # Build zone state using zone logic
+                    # Mode comes from zone_mode_tracking (supports AUTO=3), not device state
+                    mode_info = self.state_manager.get_zone_mode(zone_id)
+                    if mode_info:
+                        tracked_mode = mode_info['current_mode']  # Can be 0=Off, 1=Heat, 3=Auto
+                    else:
+                        # No tracked mode, use device state and initialize tracking
+                        tracked_mode = leader_state['mode']
+                        self.state_manager.set_zone_mode(zone_id, tracked_mode, is_manual=False)
+                    
                     zone_state = {
                         'cur_temp_c': leader_state['cur_temp_c'],
                         'cur_temp_f': leader_state['cur_temp_f'],
                         'hum_perc': leader_state['hum_perc'],
                         'target_temp_c': leader_state['target_temp_c'],
                         'target_temp_f': leader_state['target_temp_f'],
-                        'mode': 0,
+                        'mode': tracked_mode,  # Use tracked mode (supports AUTO=3)
                         'cur_heating': 0
                     }
 
@@ -596,17 +663,14 @@ class TadoLocalAPI:
                         if other_devices:
                             for valve_id in other_devices:
                                 valve_state = self._build_device_state(valve_id)
-                                if valve_state and valve_state.get('mode') == 1:
-                                    zone_state['mode'] = 1
+                                # Mode stays as tracked_mode (AUTO if set), don't override with device mode
                                 if valve_state and valve_state.get('cur_heating') == 1:
                                     zone_state['cur_heating'] = 1
                         else:
-                            # Circuit driver alone in zone - use its own state
-                            zone_state['mode'] = leader_state['mode']
+                            # Circuit driver alone in zone - use its heating state
                             zone_state['cur_heating'] = leader_state['cur_heating']
                     else:
-                        # Regular device - use leader state
-                        zone_state['mode'] = leader_state['mode']
+                        # Regular device - use leader heating state
                         zone_state['cur_heating'] = leader_state['cur_heating']
 
                     # Only broadcast if zone state actually changed

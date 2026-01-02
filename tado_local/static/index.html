@@ -227,7 +227,7 @@
 
         .mode-buttons {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 10px;
         }
 
@@ -467,6 +467,7 @@
             <!-- Tabs -->
             <div class="tabs">
                 <button class="tab-button active" data-tab="controls">Controls</button>
+                <button class="tab-button" data-tab="scheduler">Scheduler</button>
                 <button class="tab-button" data-tab="history">History</button>
             </div>
 
@@ -484,14 +485,89 @@
                 <div class="control-group">
                     <label class="control-label">Mode</label>
                     <div class="mode-buttons">
+                        <button class="mode-button" id="mode-auto" data-mode="auto">Auto</button>
                         <button class="mode-button" id="mode-heat" data-mode="heat">Heat</button>
                         <button class="mode-button" id="mode-off" data-mode="off">Off</button>
+                    </div>
+                    <div id="scheduler-status" style="font-size: 12px; color: #666; margin-top: 5px; display: none;">
+                        <span id="scheduler-status-text"></span>
                     </div>
                 </div>
 
                 <div class="action-buttons">
                     <button class="btn btn-secondary" id="btn-cancel">Cancel</button>
                     <button class="btn btn-primary" id="btn-apply">Apply</button>
+                </div>
+            </div>
+
+            <!-- Scheduler Tab -->
+            <div class="tab-content" id="tab-scheduler" style="display: none;">
+                <div id="scheduler-list">
+                    <div class="loading">Loading schedules...</div>
+                </div>
+                <div style="margin-top: 20px;">
+                    <button class="btn btn-primary" id="btn-add-schedule">Add Schedule</button>
+                </div>
+                
+                <!-- Schedule Form (hidden by default) -->
+                <div id="schedule-form" style="display: none; margin-top: 20px; padding: 20px; background: #f9f9f9; border-radius: 8px;">
+                    <h3 style="margin-bottom: 15px; font-size: 18px;">Add/Edit Schedule</h3>
+                    <div class="control-group">
+                        <label class="control-label">Schedule Type</label>
+                        <select id="schedule-type" class="history-select" style="width: 100%;">
+                            <option value="day_of_week">Day of Week</option>
+                            <option value="week_weekends">Week / Weekends</option>
+                            <option value="any_day">Any Day</option>
+                        </select>
+                    </div>
+                    <div class="control-group" id="days-selector">
+                        <label class="control-label">Days</label>
+                        <div id="days-checkboxes" style="display: flex; flex-wrap: wrap; gap: 10px;">
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="0" class="day-checkbox"> Mon
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="1" class="day-checkbox"> Tue
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="2" class="day-checkbox"> Wed
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="3" class="day-checkbox"> Thu
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="4" class="day-checkbox"> Fri
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="5" class="day-checkbox"> Sat
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 5px;">
+                                <input type="checkbox" value="6" class="day-checkbox"> Sun
+                            </label>
+                        </div>
+                        <div id="week-weekends-selector" style="display: none;">
+                            <select id="week-weekends" class="history-select" style="width: 100%;">
+                                <option value="weekdays">Weekdays (Mon-Fri)</option>
+                                <option value="weekends">Weekends (Sat-Sun)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Time (5-minute intervals)</label>
+                        <input type="time" id="schedule-time" step="300" class="history-select" style="width: 100%;" required>
+                    </div>
+                    <div class="control-group">
+                        <label class="control-label">Temperature</label>
+                        <div class="temp-control">
+                            <button type="button" class="temp-button" id="schedule-temp-down">−</button>
+                            <div class="temp-display" id="schedule-temp-display">20°</div>
+                            <button type="button" class="temp-button" id="schedule-temp-up">+</button>
+                        </div>
+                    </div>
+                    <div class="action-buttons">
+                        <button class="btn btn-secondary" id="btn-cancel-schedule">Cancel</button>
+                        <button class="btn btn-primary" id="btn-save-schedule">Save</button>
+                    </div>
                 </div>
             </div>
 
@@ -968,12 +1044,38 @@
                 let cardClass = 'zone-card';
                 let statusText = '';
                 
+                // Determine mode indicator
+                let modeIndicator = '';
                 if (mode === 0) {
                     // Off / Frost protection
                     cardClass += ' off';
                     statusText = 'Off';
+                    modeIndicator = '<span style="font-size: 10px; opacity: 0.8;">OFF</span>';
+                } else if (mode === 3) {
+                    // AUTO mode
+                    // Color by actual current temperature regardless of heating status
+                    if (temp !== null && temp !== undefined && temp < 17) {
+                        cardClass += ' heating-cold';
+                    } else if (temp !== null && temp !== undefined && temp <= 22) {
+                        cardClass += ' heating-medium';
+                    } else if (temp !== null && temp !== undefined) {
+                        cardClass += ' heating-hot';
+                    } else {
+                        // No temperature data, default to medium
+                        cardClass += ' heating-medium';
+                    }
+                    
+                    // Status text depends on whether actively heating/cooling
+                    if (curHeating === 1) {
+                        statusText = `Auto: Heating to ${target}°`;
+                    } else if (curHeating === 2) {
+                        statusText = `Auto: Cooling to ${target}°`;
+                    } else {
+                        statusText = `Auto: Target ${target}°`;
+                    }
+                    modeIndicator = '<span style="font-size: 10px; opacity: 0.8;">AUTO</span>';
                 } else {
-                    // Mode is on (heating enabled)
+                    // HEAT mode (mode === 1)
                     // Color by actual current temperature regardless of heating status
                     if (temp !== null && temp !== undefined && temp < 17) {
                         cardClass += ' heating-cold';
@@ -994,6 +1096,7 @@
                     } else {
                         statusText = `Target ${target}°`;
                     }
+                    modeIndicator = '<span style="font-size: 10px; opacity: 0.8;">HEAT</span>';
                 }
 
                 // Show icon based on cur_heating state
@@ -1022,7 +1125,7 @@
                         ${activityIcon}
                         <div>
                             <div class="zone-temp">${tempHtml}<span class="zone-temp-unit">°</span></div>
-                            <div class="zone-name">${zone.name}</div>
+                            <div class="zone-name">${zone.name} ${modeIndicator}</div>
                             <div class="zone-status">${statusText}</div>
                             ${humidityHtml}
                             ${comfortHtml}
@@ -1052,10 +1155,26 @@
             }
             
             tempValue = state.target_temp_c || 20;
-            modeValue = (state.mode === 0) ? 'off' : 'heat';
+            // Map mode: 0=off, 1=heat, 3=auto
+            if (state.mode === 0) {
+                modeValue = 'off';
+            } else if (state.mode === 3) {
+                modeValue = 'auto';
+            } else {
+                modeValue = 'heat';
+            }
             
             updateTempDisplay();
             updateModeButtons();
+            
+            // Load zone mode info for scheduler status
+            loadZoneMode(zoneId);
+            
+            // Load schedules if scheduler tab is active
+            const schedulerTab = document.getElementById('tab-scheduler');
+            if (schedulerTab && schedulerTab.style.display !== 'none') {
+                loadSchedules(zoneId);
+            }
             
             // Reset to controls tab
             document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
@@ -1082,16 +1201,48 @@
         }
 
         function updateModeButtons() {
+            document.getElementById('mode-auto').classList.toggle('active', modeValue === 'auto');
             document.getElementById('mode-heat').classList.toggle('active', modeValue === 'heat');
             document.getElementById('mode-off').classList.toggle('active', modeValue === 'off');
+            
+            // Show/hide scheduler status
+            const schedulerStatus = document.getElementById('scheduler-status');
+            if (modeValue === 'auto') {
+                schedulerStatus.style.display = 'block';
+            } else {
+                schedulerStatus.style.display = 'none';
+            }
+        }
+        
+        async function loadZoneMode(zoneId) {
+            try {
+                const response = await fetch(`/zones/${zoneId}/mode`);
+                if (!response.ok) return;
+                
+                const data = await response.json();
+                const statusText = document.getElementById('scheduler-status-text');
+                if (data.manual_override_active) {
+                    statusText.textContent = '⚠️ Manual override active - scheduler disabled';
+                } else {
+                    statusText.textContent = '✓ Scheduler active';
+                }
+            } catch (error) {
+                console.error('Failed to load zone mode:', error);
+            }
         }
 
         async function applyChanges() {
             if (!currentZone) return;
 
             const params = new URLSearchParams();
-            params.append('temperature', tempValue);
-            params.append('heating_enabled', modeValue === 'heat' ? 'true' : 'false');
+            if (modeValue === 'auto') {
+                params.append('mode', 'auto');
+            } else if (modeValue === 'heat') {
+                params.append('mode', 'heat');
+                params.append('temperature', tempValue);
+            } else {
+                params.append('mode', 'off');
+            }
 
             try {
                 const response = await fetch(`/zones/${currentZone.zone_id}/set?${params}`, {
@@ -1196,6 +1347,11 @@
             }
         });
 
+        document.getElementById('mode-auto').addEventListener('click', () => {
+            modeValue = 'auto';
+            updateModeButtons();
+        });
+
         document.getElementById('mode-heat').addEventListener('click', () => {
             modeValue = 'heat';
             updateModeButtons();
@@ -1212,6 +1368,292 @@
         document.getElementById('modal').addEventListener('click', (e) => {
             if (e.target.id === 'modal') {
                 closeModal();
+            }
+        });
+
+        // Scheduler functions
+        let scheduleTempValue = 20;
+        let editingScheduleId = null;
+        
+        function updateScheduleTempDisplay() {
+            document.getElementById('schedule-temp-display').textContent = `${scheduleTempValue}°`;
+        }
+        
+        async function loadSchedules(zoneId) {
+            if (!zoneId) return;
+            
+            const schedulerList = document.getElementById('scheduler-list');
+            schedulerList.innerHTML = '<div class="loading">Loading schedules...</div>';
+            
+            try {
+                const response = await fetch(`/zones/${zoneId}/schedules`);
+                if (!response.ok) throw new Error('Failed to load schedules');
+                
+                const data = await response.json();
+                renderSchedules(data.schedules || []);
+            } catch (error) {
+                schedulerList.innerHTML = `<div class="error">Failed to load schedules: ${error.message}</div>`;
+            }
+        }
+        
+        function renderSchedules(schedules) {
+            const schedulerList = document.getElementById('scheduler-list');
+            
+            if (schedules.length === 0) {
+                schedulerList.innerHTML = '<div class="loading">No schedules. Click "Add Schedule" to create one.</div>';
+                return;
+            }
+            
+            schedulerList.innerHTML = schedules.map(schedule => {
+                const typeLabels = {
+                    'day_of_week': 'Day',
+                    'week_weekends': 'Week',
+                    'any_day': 'Any'
+                };
+                
+                let daysText = '';
+                if (schedule.schedule_type === 'week_weekends') {
+                    daysText = schedule.days_of_week === 'weekdays' ? 'Mon-Fri' : 'Sat-Sun';
+                } else if (schedule.schedule_type === 'day_of_week') {
+                    try {
+                        const days = JSON.parse(schedule.days_of_week);
+                        const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+                        daysText = days.map(d => dayNames[d]).join(', ');
+                    } catch {
+                        daysText = schedule.days_of_week;
+                    }
+                } else {
+                    daysText = 'Every day';
+                }
+                
+                return `
+                    <div style="background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; border: 1px solid #ddd;">
+                        <div style="display: flex; justify-content: space-between; align-items: start;">
+                            <div>
+                                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 5px;">
+                                    <span style="background: #ff7b2e; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;">
+                                        ${typeLabels[schedule.schedule_type] || schedule.schedule_type}
+                                    </span>
+                                    <span style="font-weight: 500;">${schedule.time}</span>
+                                    <span style="color: #666;">${daysText}</span>
+                                </div>
+                                <div style="font-size: 24px; color: #ff7b2e; font-weight: 300;">
+                                    ${schedule.temperature}°
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 5px; align-items: center;">
+                                <label style="display: flex; align-items: center; gap: 5px; font-size: 12px;">
+                                    <input type="checkbox" ${schedule.enabled ? 'checked' : ''} 
+                                           onchange="toggleSchedule(${schedule.schedule_id}, this.checked)">
+                                    Enabled
+                                </label>
+                                <button onclick="editSchedule(${schedule.schedule_id})" 
+                                        style="padding: 5px 10px; border: 1px solid #ddd; background: white; border-radius: 4px; cursor: pointer;">
+                                    Edit
+                                </button>
+                                <button onclick="deleteSchedule(${schedule.schedule_id})" 
+                                        style="padding: 5px 10px; border: 1px solid #ddd; background: #ffebee; color: #c62828; border-radius: 4px; cursor: pointer;">
+                                    Delete
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+        
+        async function toggleSchedule(scheduleId, enabled) {
+            if (!currentZone) return;
+            
+            try {
+                const response = await fetch(`/zones/${currentZone.zone_id}/schedules/${scheduleId}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({enabled: enabled})
+                });
+                
+                if (!response.ok) throw new Error('Failed to update schedule');
+                loadSchedules(currentZone.zone_id);
+            } catch (error) {
+                showError('Failed to update schedule: ' + error.message);
+            }
+        }
+        
+        async function deleteSchedule(scheduleId) {
+            if (!currentZone) return;
+            if (!confirm('Delete this schedule?')) return;
+            
+            try {
+                const response = await fetch(`/zones/${currentZone.zone_id}/schedules/${scheduleId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) throw new Error('Failed to delete schedule');
+                loadSchedules(currentZone.zone_id);
+            } catch (error) {
+                showError('Failed to delete schedule: ' + error.message);
+            }
+        }
+        
+        function editSchedule(scheduleId) {
+            // Load schedule and populate form
+            if (!currentZone) return;
+            
+            fetch(`/zones/${currentZone.zone_id}/schedules`)
+                .then(r => r.json())
+                .then(data => {
+                    const schedule = data.schedules.find(s => s.schedule_id === scheduleId);
+                    if (!schedule) return;
+                    
+                    editingScheduleId = scheduleId;
+                    document.getElementById('schedule-type').value = schedule.schedule_type;
+                    scheduleTempValue = schedule.temperature;
+                    updateScheduleTempDisplay();
+                    document.getElementById('schedule-time').value = schedule.time;
+                    
+                    // Handle days based on type
+                    if (schedule.schedule_type === 'week_weekends') {
+                        document.getElementById('week-weekends').value = schedule.days_of_week;
+                        document.getElementById('days-checkboxes').style.display = 'none';
+                        document.getElementById('week-weekends-selector').style.display = 'block';
+                    } else if (schedule.schedule_type === 'day_of_week') {
+                        try {
+                            const days = JSON.parse(schedule.days_of_week);
+                            document.querySelectorAll('.day-checkbox').forEach(cb => {
+                                cb.checked = days.includes(parseInt(cb.value));
+                            });
+                        } catch {}
+                        document.getElementById('days-checkboxes').style.display = 'flex';
+                        document.getElementById('week-weekends-selector').style.display = 'none';
+                    } else {
+                        document.getElementById('days-checkboxes').style.display = 'none';
+                        document.getElementById('week-weekends-selector').style.display = 'none';
+                    }
+                    
+                    document.getElementById('schedule-form').style.display = 'block';
+                    document.getElementById('btn-add-schedule').textContent = 'Cancel';
+                })
+                .catch(error => {
+                    showError('Failed to load schedule: ' + error.message);
+                });
+        }
+        
+        // Schedule form handlers
+        document.getElementById('schedule-type').addEventListener('change', (e) => {
+            const type = e.target.value;
+            if (type === 'week_weekends') {
+                document.getElementById('days-checkboxes').style.display = 'none';
+                document.getElementById('week-weekends-selector').style.display = 'block';
+            } else if (type === 'day_of_week') {
+                document.getElementById('days-checkboxes').style.display = 'flex';
+                document.getElementById('week-weekends-selector').style.display = 'none';
+            } else {
+                document.getElementById('days-checkboxes').style.display = 'none';
+                document.getElementById('week-weekends-selector').style.display = 'none';
+            }
+        });
+        
+        document.getElementById('schedule-temp-up').addEventListener('click', () => {
+            if (scheduleTempValue < 30) {
+                scheduleTempValue += 0.5;
+                updateScheduleTempDisplay();
+            }
+        });
+        
+        document.getElementById('schedule-temp-down').addEventListener('click', () => {
+            if (scheduleTempValue > 5) {
+                scheduleTempValue -= 0.5;
+                updateScheduleTempDisplay();
+            }
+        });
+        
+        document.getElementById('btn-add-schedule').addEventListener('click', () => {
+            const form = document.getElementById('schedule-form');
+            if (form.style.display === 'none') {
+                editingScheduleId = null;
+                scheduleTempValue = 20;
+                updateScheduleTempDisplay();
+                document.getElementById('schedule-type').value = 'day_of_week';
+                document.getElementById('schedule-time').value = '08:00';
+                document.querySelectorAll('.day-checkbox').forEach(cb => cb.checked = false);
+                document.getElementById('days-checkboxes').style.display = 'flex';
+                document.getElementById('week-weekends-selector').style.display = 'none';
+                form.style.display = 'block';
+                document.getElementById('btn-add-schedule').textContent = 'Cancel';
+            } else {
+                form.style.display = 'none';
+                document.getElementById('btn-add-schedule').textContent = 'Add Schedule';
+            }
+        });
+        
+        document.getElementById('btn-cancel-schedule').addEventListener('click', () => {
+            document.getElementById('schedule-form').style.display = 'none';
+            document.getElementById('btn-add-schedule').textContent = 'Add Schedule';
+            editingScheduleId = null;
+        });
+        
+        document.getElementById('btn-save-schedule').addEventListener('click', async () => {
+            if (!currentZone) return;
+            
+            const scheduleType = document.getElementById('schedule-type').value;
+            let daysOfWeek = '';
+            
+            if (scheduleType === 'week_weekends') {
+                daysOfWeek = document.getElementById('week-weekends').value;
+            } else if (scheduleType === 'day_of_week') {
+                const selectedDays = Array.from(document.querySelectorAll('.day-checkbox:checked'))
+                    .map(cb => parseInt(cb.value));
+                if (selectedDays.length === 0) {
+                    showError('Please select at least one day');
+                    return;
+                }
+                daysOfWeek = JSON.stringify(selectedDays);
+            } else {
+                daysOfWeek = '*';
+            }
+            
+            const time = document.getElementById('schedule-time').value;
+            if (!time) {
+                showError('Please select a time');
+                return;
+            }
+            
+            // Validate 5-minute interval
+            const minutes = parseInt(time.split(':')[1]);
+            if (minutes % 5 !== 0) {
+                showError('Time must be in 5-minute intervals (:00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55)');
+                return;
+            }
+            
+            try {
+                const url = editingScheduleId 
+                    ? `/zones/${currentZone.zone_id}/schedules/${editingScheduleId}`
+                    : `/zones/${currentZone.zone_id}/schedules`;
+                
+                const method = editingScheduleId ? 'PUT' : 'POST';
+                
+                const response = await fetch(url, {
+                    method: method,
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        schedule_type: scheduleType,
+                        days_of_week: daysOfWeek,
+                        time: time,
+                        temperature: scheduleTempValue
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to save schedule');
+                }
+                
+                document.getElementById('schedule-form').style.display = 'none';
+                document.getElementById('btn-add-schedule').textContent = 'Add Schedule';
+                editingScheduleId = null;
+                loadSchedules(currentZone.zone_id);
+            } catch (error) {
+                showError('Failed to save schedule: ' + error.message);
             }
         });
 
@@ -1234,6 +1676,11 @@
                 if (tab === 'history' && currentZone) {
                     const hours = parseInt(document.getElementById('history-period').value);
                     loadHistory(currentZone.zone_id, hours);
+                }
+                
+                // Load schedules when scheduler tab is opened
+                if (tab === 'scheduler' && currentZone) {
+                    loadSchedules(currentZone.zone_id);
                 }
             });
         });

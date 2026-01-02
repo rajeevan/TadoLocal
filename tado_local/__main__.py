@@ -54,6 +54,15 @@ async def run_server(args):
         logger.info(f"Received signal {signum}, initiating immediate shutdown...")
         shutdown_event.set()
 
+        # Immediately stop scheduler service
+        if tado_api and tado_api.scheduler_service:
+            logger.info("Stopping scheduler service immediately...")
+            # Set running flag to False to stop the loop
+            tado_api.scheduler_service.running = False
+            # Cancel the task if it exists
+            if tado_api.scheduler_service.task:
+                tado_api.scheduler_service.task.cancel()
+
         # Immediately close SSE streams
         if tado_api:
             logger.info("Closing SSE event streams immediately...")

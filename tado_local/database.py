@@ -162,13 +162,16 @@ def ensure_schema_and_migrate(db_path: str):
     Creates core schemas (DB_SCHEMA, HOMEKIT_SCHEMA, CLOUD_SCHEMA) and applies
     incremental migrations. Currently migration to user_version 2 adds a stable
     uuid column to the `zones` table and populates it with generated UUIDs.
+    Migration to version 3 adds zone_schedules and zone_mode_tracking tables.
     """
     import sqlite3
     import uuid as _uuid
+    import logging
+    logger = logging.getLogger(__name__)
     # Supported schema version for this codebase. If the database reports a
     # higher user_version we should refuse to start to avoid silent data loss
     # or incompatible assumptions.
-    SUPPORTED_SCHEMA_VERSION = 2
+    SUPPORTED_SCHEMA_VERSION = 3
 
     # Open connection and check current schema version before applying changes
     conn = sqlite3.connect(db_path)
@@ -230,13 +233,75 @@ def ensure_schema_and_migrate(db_path: str):
             except Exception:
                 pass
             raise
-        finally:
-            conn.close()
-    else:
-        conn.close()
+
+    # Migration to version 3: add zone_schedules and zone_mode_tracking tables
+    if current_version < 3:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Create zone_schedules table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS zone_schedules (
+                        schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        zone_id INTEGER NOT NULL,
+                        schedule_type TEXT NOT NULL CHECK(schedule_type IN ('day_of_week', 'week_weekends', 'any_day')),
+                        days_of_week TEXT NOT NULL,
+                        time TEXT NOT NULL CHECK(time LIKE '%:00' OR time LIKE '%:05' OR time LIKE '%:10' OR time LIKE '%:15' OR time LIKE '%:20' OR time LIKE '%:25' OR time LIKE '%:30' OR time LIKE '%:35' OR time LIKE '%:40' OR time LIKE '%:45' OR time LIKE '%:50' OR time LIKE '%:55'),
+                        temperature REAL NOT NULL,
+                        enabled BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (zone_id) REFERENCES zones(zone_id) ON DELETE CASCADE
+                    )
+                """)
+                
+                # Create zone_mode_tracking table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS zone_mode_tracking (
+                        zone_id INTEGER PRIMARY KEY,
+                        current_mode INTEGER NOT NULL DEFAULT 1 CHECK(current_mode IN (0, 1, 3)),
+                        manual_override_active BOOLEAN DEFAULT 0,
+                        last_manual_change TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (zone_id) REFERENCES zones(zone_id) ON DELETE CASCADE
+                    )
+                """)
+                
+                # Create indexes for better query performance
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_zone_time ON zone_schedules(zone_id, time)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON zone_schedules(enabled)")
+                
+                # Initialize zone_mode_tracking for existing zones
+                # Default to HEAT (1) if mode != 0, otherwise OFF (0)
+                cursor = conn.execute("SELECT zone_id, leader_device_id FROM zones")
+                for zone_id, leader_device_id in cursor.fetchall():
+                    if leader_device_id:
+                        # Try to get current mode from device state
+                        # We'll default to HEAT (1) for now, actual mode will be synced on next state update
+                        conn.execute("""
+                            INSERT OR IGNORE INTO zone_mode_tracking (zone_id, current_mode, manual_override_active)
+                            VALUES (?, 1, 0)
+                        """, (zone_id,))
+                    else:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO zone_mode_tracking (zone_id, current_mode, manual_override_active)
+                            VALUES (?, 0, 0)
+                        """, (zone_id,))
+
+                conn.execute("PRAGMA user_version = 3")
+                current_version = 3
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        except Exception as e:
+            logger.error(f"Migration to version 3 failed: {e}")
+            raise
 
     # Ensure all schema scripts applied now that migrations are done
-    conn = sqlite3.connect(db_path)
     _apply_script_tolerant(conn, DB_SCHEMA)
     _apply_script_tolerant(conn, HOMEKIT_SCHEMA)
     _apply_script_tolerant(conn, CLOUD_SCHEMA)

@@ -18,6 +18,8 @@ Tado Local is a **REST API backend** that connects your Tado smart heating syste
 - **🔌 Direct Local Control** - HomeKit protocol communication with your Tado bridge - no cloud required
 - **📊 Setup & Debug UI** - Web interface for initial configuration and troubleshooting
 - **🔧 Interactive API Docs** - Built-in Swagger UI at `/docs`
+- **📅 Climate Scheduler** - Automated temperature schedules with support for day-of-week, week/weekends, and any-day patterns
+- **🤖 Auto Mode** - Intelligent scheduling mode that automatically adjusts temperature based on your schedules
 
 ### Why Choose Local Control?
 
@@ -103,6 +105,14 @@ GET /events
 
 # System status
 GET /status
+
+# Climate scheduling endpoints
+GET /zones/{zone_id}/schedules          # Get all schedules for a zone
+POST /zones/{zone_id}/schedules         # Create a new schedule
+PUT /zones/{zone_id}/schedules/{schedule_id}  # Update a schedule
+DELETE /zones/{zone_id}/schedules/{schedule_id}  # Delete a schedule
+GET /zones/{zone_id}/mode               # Get current mode (auto/heat/off)
+POST /zones/{zone_id}/set?mode=auto     # Set zone mode (auto/heat/off)
 ```
 
 **Complete API Documentation**: `http://localhost:4407/docs` (interactive Swagger UI with try-it-now functionality)
@@ -250,6 +260,209 @@ While the REST API is the primary interface for integrations, Tado Local include
 *Interactive charts showing data available via the history API endpoint*
 
 **Note**: Most users will interact with Tado Local through their smart home platform (Domoticz, Home Assistant, etc.) rather than the web UI.
+
+---
+
+## 📅 Climate Scheduler
+
+Tado Local includes a built-in climate scheduler that allows you to automate temperature changes based on time and day patterns. This feature works entirely locally without requiring cloud connectivity.
+
+### Features
+
+- **Three Schedule Types**:
+  - **Day of Week**: Specific days (e.g., Monday, Wednesday, Friday)
+  - **Week/Weekends**: Separate schedules for weekdays vs weekends
+  - **Any Day**: Same schedule every day of the week
+
+- **5-Minute Time Resolution**: All schedule times are rounded to 5-minute intervals (e.g., 08:00, 08:05, 08:10, etc.)
+
+- **Auto Mode**: When a zone is set to "Auto" mode, the scheduler automatically applies scheduled temperatures. Manual changes on the thermostat or via API will switch the zone to "Heat" mode and pause scheduling until you switch back to "Auto".
+
+- **Persistent Storage**: All schedules are stored in SQLite database and persist across restarts
+
+### Using the Scheduler
+
+#### Via Web UI
+
+1. Open the web interface at `http://localhost:4407`
+2. Click on any zone card to open the control panel
+3. Navigate to the **"Scheduler"** tab
+4. Click **"Add Schedule"** to create a new schedule entry
+5. Configure:
+   - **Schedule Type**: Choose day-of-week, week/weekends, or any day
+   - **Days**: Select specific days (for day-of-week type) or week/weekends
+   - **Time**: Set the time in 5-minute intervals (e.g., 08:00, 18:30)
+   - **Temperature**: Target temperature in Celsius
+   - **Enabled**: Toggle to enable/disable the schedule
+6. Click **"Save"** to create the schedule
+
+#### Via REST API
+
+**Create a Schedule**:
+```bash
+curl -X POST http://localhost:4407/zones/1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schedule_type": "day_of_week",
+    "days_of_week": "[1,2,3,4,5]",
+    "time": "08:00",
+    "temperature": 21.0,
+    "enabled": true
+  }'
+```
+
+**Get All Schedules for a Zone**:
+```bash
+curl http://localhost:4407/zones/1/schedules
+```
+
+**Update a Schedule**:
+```bash
+curl -X PUT http://localhost:4407/zones/1/schedules/1 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "time": "08:30",
+    "temperature": 21.5
+  }'
+```
+
+**Delete a Schedule**:
+```bash
+curl -X DELETE http://localhost:4407/zones/1/schedules/1
+```
+
+**Set Zone to Auto Mode**:
+```bash
+curl -X POST "http://localhost:4407/zones/1/set?mode=auto"
+```
+
+When switching to Auto mode, the system will:
+- Find the current/relevant schedule for the zone
+- Apply that schedule's temperature immediately
+- Continue to apply scheduled temperatures automatically going forward
+
+**Get Current Zone Mode**:
+```bash
+curl http://localhost:4407/zones/1/mode
+```
+
+### Schedule Types Explained
+
+#### Day of Week (`day_of_week`)
+Select specific days of the week. Days are represented as integers:
+- `0` = Monday
+- `1` = Tuesday
+- `2` = Wednesday
+- `3` = Thursday
+- `4` = Friday
+- `5` = Saturday
+- `6` = Sunday
+
+Example: `"[1,2,3,4,5]"` means Monday through Friday.
+
+#### Week/Weekends (`week_weekends`)
+Two options:
+- `"weekdays"` - Monday through Friday
+- `"weekends"` - Saturday and Sunday
+
+#### Any Day (`any_day`)
+Applies to all days of the week. The `days_of_week` field should be set to `"any"`.
+
+### How Auto Mode Works
+
+1. **Setting Auto Mode**: When you set a zone to Auto mode (via API or web UI), the scheduler:
+   - Finds the most relevant schedule for the current time/day
+   - Applies that schedule's temperature immediately
+   - Sets the thermostat to "Heat" mode (since hardware doesn't support Auto)
+   - Tracks "Auto" mode locally in the service
+
+2. **Automatic Temperature Changes**: The scheduler runs in the background and checks every minute for matching schedules. When a schedule matches:
+   - The temperature is automatically applied to the zone
+   - The thermostat remains in "Heat" mode
+   - Changes are logged and broadcast via SSE events
+
+3. **Manual Override**: If you manually change the temperature (on the thermostat or via API) while in Auto mode:
+   - The zone automatically switches to "Heat" mode
+   - The scheduler stops applying temperatures
+   - Manual override flag is set
+   - To resume scheduling, switch back to Auto mode
+
+4. **Switching Back to Auto**: When switching from Heat/Off back to Auto:
+   - The current/relevant schedule temperature is applied immediately
+   - Scheduling resumes automatically
+
+### Example: Daily Schedule
+
+Create a typical daily schedule with different temperatures for morning, day, evening, and night:
+
+```bash
+# Morning: 7:00 AM - 21°C (weekdays)
+curl -X POST http://localhost:4407/zones/1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"schedule_type": "week_weekends", "days_of_week": "weekdays", "time": "07:00", "temperature": 21.0}'
+
+# Day: 9:00 AM - 19°C (weekdays)
+curl -X POST http://localhost:4407/zones/1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"schedule_type": "week_weekends", "days_of_week": "weekdays", "time": "09:00", "temperature": 19.0}'
+
+# Evening: 6:00 PM - 22°C (any day)
+curl -X POST http://localhost:4407/zones/1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"schedule_type": "any_day", "days_of_week": "any", "time": "18:00", "temperature": 22.0}'
+
+# Night: 10:00 PM - 18°C (any day)
+curl -X POST http://localhost:4407/zones/1/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"schedule_type": "any_day", "days_of_week": "any", "time": "22:00", "temperature": 18.0}'
+
+# Enable Auto mode
+curl -X POST "http://localhost:4407/zones/1/set?mode=auto"
+```
+
+### Python Integration Example
+
+```python
+import requests
+
+TADO_API = "http://localhost:4407"
+zone_id = 1
+
+# Create a schedule
+schedule = {
+    "schedule_type": "day_of_week",
+    "days_of_week": "[0,1,2,3,4]",  # Monday-Friday
+    "time": "08:00",
+    "temperature": 21.0,
+    "enabled": True
+}
+
+response = requests.post(
+    f"{TADO_API}/zones/{zone_id}/schedules",
+    json=schedule
+)
+print(f"Created schedule: {response.json()}")
+
+# Get all schedules
+schedules = requests.get(f"{TADO_API}/zones/{zone_id}/schedules").json()
+print(f"Zone has {len(schedules['schedules'])} schedules")
+
+# Set zone to Auto mode
+requests.post(f"{TADO_API}/zones/{zone_id}/set", params={"mode": "auto"})
+
+# Check current mode
+mode = requests.get(f"{TADO_API}/zones/{zone_id}/mode").json()
+print(f"Current mode: {mode['current_mode']} (Auto={mode['current_mode']==3})")
+```
+
+### Notes
+
+- **Time Format**: All times must be in `HH:MM` format with 5-minute intervals (e.g., `08:00`, `08:05`, `08:10`, `18:30`)
+- **Temperature Range**: Follows your thermostat's supported range (typically 5-30°C)
+- **Multiple Schedules**: You can create multiple schedules for the same zone. The scheduler will apply the matching schedule at the specified time
+- **Timezone**: Schedules use the server's local timezone
+- **Persistence**: Schedules are stored in the SQLite database and persist across restarts
+- **Background Service**: The scheduler runs as a background service and checks for matching schedules every minute
 
 ---
 

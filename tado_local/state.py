@@ -586,3 +586,76 @@ class DeviceStateManager:
         devices = [dict(zip(columns, row)) for row in cursor.fetchall()]
         conn.close()
         return devices
+
+    def set_zone_mode(self, zone_id: int, mode: int, is_manual: bool = False):
+        """
+        Set zone mode and track manual override status.
+        
+        Args:
+            zone_id: Zone ID
+            mode: Mode value (0=Off, 1=Heat, 3=Auto)
+            is_manual: True if this is a manual change (sets override flag)
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if is_manual:
+                conn.execute("""
+                    INSERT INTO zone_mode_tracking (zone_id, current_mode, manual_override_active, last_manual_change, updated_at)
+                    VALUES (?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(zone_id) DO UPDATE SET
+                        current_mode = excluded.current_mode,
+                        manual_override_active = 1,
+                        last_manual_change = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (zone_id, mode))
+            else:
+                conn.execute("""
+                    INSERT INTO zone_mode_tracking (zone_id, current_mode, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(zone_id) DO UPDATE SET
+                        current_mode = excluded.current_mode,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (zone_id, mode))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_zone_mode(self, zone_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get current zone mode and override status.
+        
+        Returns:
+            Dict with 'current_mode', 'manual_override_active', 'last_manual_change'
+            or None if zone not found
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute("""
+                SELECT current_mode, manual_override_active, last_manual_change
+                FROM zone_mode_tracking
+                WHERE zone_id = ?
+            """, (zone_id,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'current_mode': row[0],
+                    'manual_override_active': bool(row[1]),
+                    'last_manual_change': row[2]
+                }
+            return None
+        finally:
+            conn.close()
+
+    def clear_manual_override(self, zone_id: int):
+        """Clear manual override flag for a zone (when switching to AUTO)."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("""
+                UPDATE zone_mode_tracking
+                SET manual_override_active = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE zone_id = ?
+            """, (zone_id,))
+            conn.commit()
+        finally:
+            conn.close()
